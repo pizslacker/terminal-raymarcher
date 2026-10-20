@@ -1,5 +1,5 @@
 /*
- * neon-marcher-avx2.c - 8-Wide AVX2 + FMA SIMD Terminal Raymarcher
+ * terminal-marcher-avx2.c - 8-Wide AVX2 + FMA SIMD Terminal Raymarcher
  * Features: DEC Mode 2026 VSync, ANSI RLE State Deduplication, Absolute Frame Pacing
  * Copyright (C) k!M/pizslacker 2026
  *
@@ -16,8 +16,8 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  * 
- * Compile: gcc -O3 -march=native -mavx2 -mfma -pthread neon_marcher_avx2.c -o neon_marcher_avx2 -lm
- * Run:     ./neon_marcher_avx2
+ * Compile: gcc -O3 -march=native -mavx2 -mfma -pthread terminal-marcher-avx2.c -o terminal-marcher-avx2 -lm
+ * Run:     ./terminal-marcher-avx2
  */
 
 #define _POSIX_C_SOURCE 200809L
