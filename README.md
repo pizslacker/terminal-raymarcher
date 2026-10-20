@@ -15,6 +15,8 @@ Instead of outputting a static image or requiring external graphics libraries li
 - **Live Terminal Resizing**: Catches SIGWINCH signals to dynamically reallocate framebuffers on the fly when you resize or maximize your terminal window.
 
 ## 8-Wide AVX2 + FMA SIMD Terminal Raymarcher
+To evaluate 8 rays simultaneously using AVX2 (`__m256`) and FMA (`_mm256_fmadd_ps`), you must transition from an **Array-of-Structures (AoS)** layout (`vec3 {x, y, z}`) to a **Structure-of-Arrays (SoA)** layout (`vec3_avx { __m256 x, y, z }`), where each vector holds 8 contiguous horizontal pixel lanes.
+
 - **SoA Data Layout (`vec3_avx`)**: Instead of holding $(x, y, z)$ for 1 pixel in a register, three 256-bit YMM registers hold $[x_0 \dots x_7]$, $[y_0 \dots y_7]$, and $[z_0 \dots z_7]$. Every arithmetic instruction operates across 8 horizontal pixels in lockstep.
 - **Branchless Predication & Lane Masking**: In a scalar raymarcher, a single ray breaks out of the `for` loop as soon as `h.dist < 0.0025f` or `total_dist > 22.0f`. In SIMD, some of the 8 rays will hit geometry early while neighboring rays continue marching into the background. We maintain an `active_mask` using `_mm256_cmp_ps(..., _CMP_GT_OQ)` and only break the 8-wide packet when `_mm256_movemask_ps(active_mask) == 0`.
 - **Fast Polynomial $\sin/\cos$ (`sin256_ps` / `cos256_ps`)**: The standard C library (`sinf`/`cosf`) has no portable AVX2 intrinsic in `immintrin.h`, and unpacking `__m256` registers to call scalar `sinf` 8 times destroys SIMD throughput. Below is an inline range-reduced minimax polynomial that computes 8 sines and cosines simultaneously in ~12 clock cycles using FMA.
