@@ -1,5 +1,5 @@
 /*
- * neon-marcher.c - Multithreaded TrueColor Terminal 3D Raymarcher
+ * terminal-marcher.c - Multithreaded TrueColor Terminal 3D Raymarcher
  * Copyright (C) k!M/pizslacker 2026
  *
  * This program is free software: you can redistribute it and/or modify
@@ -15,8 +15,8 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  *
- * Compile: gcc -O3 -march=native -pthread neon_marcher.c -o neon_marcher -lm
- * Run:     ./neon_marcher
+ * Compile: gcc -O3 -march=native -pthread terminal-marcher.c -o terminal-marcher -lm
+ * Run:     ./terminal-marcher
  */
 
 #define _POSIX_C_SOURCE 200809L
