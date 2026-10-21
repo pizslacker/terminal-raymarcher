@@ -1,59 +1,63 @@
-# Compiler and base flags
 CC       := gcc
 STD      := -std=c11
 WARN     := -Wall -Wextra -Wpedantic
 OPT      := -O3 -march=native -flto -ffast-math -funroll-loops
 SIMD     := -mavx2 -mfma
-LDFLAGS  := -pthread -lm
+LDFLAGS  := -pthread -lm -lxmp -lasound
 
 CFLAGS_SCALAR := $(STD) $(WARN) $(OPT)
 CFLAGS_AVX2   := $(STD) $(WARN) $(OPT) $(SIMD)
 
-# Auto-detect whether source files use hyphens or underscores
-SRC_SCALAR := $(firstword $(wildcard terminal-marcher.c terminal_marcher.c))
-SRC_AVX2   := $(firstword $(wildcard terminal-marcher-avx2.c terminal_marcher_avx2.c))
+SRC_SCALAR := $(firstword $(wildcard terminal-raymarcher.c terminal_raymarcher.c))
+SRC_AVX2   := $(firstword $(wildcard terminal-raymarcher-avx2.c terminal_raymarcher_avx2.c))
 
-# Default fallback names if files haven't been created yet
 ifeq ($(SRC_SCALAR),)
-    SRC_SCALAR := terminal-marcher.c
+    SRC_SCALAR := terminal-raymarcher.c
 endif
 ifeq ($(SRC_AVX2),)
-    SRC_AVX2 := terminal-marcher-avx2.c
+    SRC_AVX2 := terminal-raymarcher-avx2.c
 endif
 
-BIN_SCALAR := terminal-marcher
-BIN_AVX2   := terminal-marcher-avx2
+# Auto-detect any .mod, .xm, .s3m, or .it file in the directory to embed
+TRACK ?= $(firstword $(wildcard *.mod *.xm *.s3m *.it))
+EMBED_HDR := embedded_mod.h
 
-.PHONY: all scalar avx2 run-scalar run-avx2 asm debug clean
+BIN_SCALAR := terminal-raymarcher
+BIN_AVX2   := terminal-raymarcher-avx2
 
-# Build both binaries by default
+.PHONY: all scalar avx2 embed run-scalar run-avx2 clean
+
 all: $(BIN_SCALAR) $(BIN_AVX2)
 
 scalar: $(BIN_SCALAR)
 avx2: $(BIN_AVX2)
 
-$(BIN_SCALAR): $(SRC_SCALAR)
+# Generate embedded_mod.h from $(TRACK) or create a safe empty fallback
+$(EMBED_HDR): $(TRACK)
+ifneq ($(TRACK),)
+	@echo "Embedding tracker module: $(TRACK) -> $(EMBED_HDR)"
+	xxd -i -n embedded_mod_data "$(TRACK)" | sed 's/unsigned char/static const unsigned char/; s/unsigned int/static const unsigned int/' > $(EMBED_HDR)
+else
+	@echo "No .mod/.xm found; generating empty $(EMBED_HDR) fallback"
+	@printf "static const unsigned char embedded_mod_data[] = {0};\nstatic const unsigned int embedded_mod_data_len = 0;\n" > $(EMBED_HDR)
+endif
+
+# Force re-embedding if you pass make embed TRACK=new_song.xm
+embed:
+	rm -f $(EMBED_HDR)
+	$(MAKE) $(EMBED_HDR)
+
+$(BIN_SCALAR): $(SRC_SCALAR) $(EMBED_HDR)
 	$(CC) $(CFLAGS_SCALAR) $< -o $@ $(LDFLAGS)
 
-$(BIN_AVX2): $(SRC_AVX2)
+$(BIN_AVX2): $(SRC_AVX2) $(EMBED_HDR)
 	$(CC) $(CFLAGS_AVX2) $< -o $@ $(LDFLAGS)
-
-# Quick launch targets
-run-scalar: $(BIN_SCALAR)
-	./$(BIN_SCALAR)
 
 run-avx2: $(BIN_AVX2)
 	./$(BIN_AVX2)
 
-# Dump annotated Intel-syntax assembly to inspect YMM register usage
-asm: $(SRC_AVX2)
-	$(CC) $(CFLAGS_AVX2) -S -fverbose-asm -masm=intel $< -o $(BIN_AVX2).s
-	@echo "Generated Intel-syntax assembly in $(BIN_AVX2).s"
-
-# Build with debug symbols and AddressSanitizer
-debug: $(SRC_SCALAR) $(SRC_AVX2)
-	$(CC) $(STD) $(WARN) -O0 -g3 -fsanitize=address,undefined $(SRC_SCALAR) -o $(BIN_SCALAR)-dbg $(LDFLAGS)
-	$(CC) $(STD) $(WARN) $(SIMD) -O0 -g3 -fsanitize=address,undefined $(SRC_AVX2) -o $(BIN_AVX2)-dbg $(LDFLAGS)
+run-scalar: $(BIN_SCALAR)
+	./$(BIN_SCALAR)
 
 clean:
-	rm -f $(BIN_SCALAR) $(BIN_AVX2) $(BIN_SCALAR)-dbg $(BIN_AVX2)-dbg $(BIN_AVX2).s
+	rm -f $(BIN_SCALAR) $(BIN_AVX2) $(EMBED_HDR)

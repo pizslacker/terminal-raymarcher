@@ -25,7 +25,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdalign.h> /* Defines alignas -> _Alignas */
+#include <stdalign.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -37,6 +38,141 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <xmp.h>
+#include <alsa/asoundlib.h>
+
+#include "embedded_mod.h"
+
+/* --- Global Lifecycle & Audio-Visual Sync State (Declared First) --- */
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_resized = 1;
+static _Atomic bool          g_paused  = false;
+
+static _Atomic float g_audio_bass  = 0.0f;
+static _Atomic int   g_tracker_bpm = 0;
+static _Atomic int   g_tracker_pos = 0;
+static _Atomic int   g_tracker_row = 0;
+
+/* --- Tracker Audio Subsystem --- */
+typedef struct {
+    const char *mod_path;
+    pthread_t   thread;
+    bool        active;
+} TrackerEngine;
+
+static void *tracker_audio_thread(void *arg) {
+    const char *mod_path = (const char *)arg;
+
+    xmp_context ctx = xmp_create_context();
+    if (!ctx) return NULL;
+
+    int load_res = -1;
+    if (mod_path && access(mod_path, R_OK) == 0) {
+        load_res = xmp_load_module(ctx, (char *)mod_path);
+    } else if (embedded_mod_data_len > 1) {
+        load_res = xmp_load_module_from_memory(
+            ctx,
+            (void *)embedded_mod_data,
+            (long)embedded_mod_data_len
+        );
+    }
+
+    if (load_res < 0) {
+        xmp_free_context(ctx);
+        return NULL;
+    }
+
+    if (xmp_start_player(ctx, 44100, 0) < 0) {
+        xmp_release_module(ctx);
+        xmp_free_context(ctx);
+        return NULL;
+    }
+
+    snd_pcm_t *pcm = NULL;
+    if (snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+        xmp_end_player(ctx);
+        xmp_release_module(ctx);
+        xmp_free_context(ctx);
+        return NULL;
+    }
+
+    if (snd_pcm_set_params(pcm,
+                           SND_PCM_FORMAT_S16_LE,
+                           SND_PCM_ACCESS_RW_INTERLEAVED,
+                           2, 44100, 1, 25000) < 0) {
+        snd_pcm_close(pcm);
+        xmp_end_player(ctx);
+        xmp_release_module(ctx);
+        xmp_free_context(ctx);
+        return NULL;
+    }
+
+    int16_t pcm_buf[1024 * 2];
+    struct xmp_frame_info fi;
+    float smooth_env = 0.0f;
+
+    while (g_running) {
+        if (atomic_load_explicit(&g_paused, memory_order_relaxed)) {
+            struct timespec ts = {0, 10000000L};
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
+        if (xmp_play_buffer(ctx, pcm_buf, sizeof(pcm_buf), 0) < 0) {
+            break;
+        }
+
+        xmp_get_frame_info(ctx, &fi);
+        atomic_store_explicit(&g_tracker_bpm, fi.bpm, memory_order_relaxed);
+        atomic_store_explicit(&g_tracker_pos, fi.pos, memory_order_relaxed);
+        atomic_store_explicit(&g_tracker_row, fi.row, memory_order_relaxed);
+
+        uint64_t sum_sq = 0;
+        for (int i = 0; i < 2048; i += 4) {
+            int32_t s = pcm_buf[i];
+            sum_sq += (uint64_t)(s * s);
+        }
+        float rms = sqrtf((float)(sum_sq / 512)) / 32768.0f;
+        float ch0_vol = (float)fi.channel_info[0].volume / 64.0f;
+        float target_pulse = fminf(1.0f, rms * 2.2f + ch0_vol * 0.4f);
+
+        if (target_pulse > smooth_env)
+            smooth_env = target_pulse;
+        else
+            smooth_env = smooth_env * 0.88f + target_pulse * 0.12f;
+
+        atomic_store_explicit(&g_audio_bass, smooth_env, memory_order_relaxed);
+
+        snd_pcm_sframes_t frames = snd_pcm_writei(pcm, pcm_buf, 1024);
+        if (frames < 0) {
+            snd_pcm_recover(pcm, (int)frames, 1);
+        }
+    }
+
+    snd_pcm_drain(pcm);
+    snd_pcm_close(pcm);
+    xmp_end_player(ctx);
+    xmp_release_module(ctx);
+    xmp_free_context(ctx);
+    return NULL;
+}
+
+static void tracker_start(TrackerEngine *te, const char *mod_path) {
+    te->mod_path = mod_path;
+    te->active = false;
+    if ((mod_path && access(mod_path, R_OK) == 0) || embedded_mod_data_len > 1) {
+        if (pthread_create(&te->thread, NULL, tracker_audio_thread, (void *)mod_path) == 0) {
+            te->active = true;
+        }
+    }
+}
+
+static void tracker_stop(TrackerEngine *te) {
+    if (te->active) {
+        pthread_join(te->thread, NULL);
+        te->active = false;
+    }
+}
 
 /* --- Scalar Helper Primitives --- */
 typedef struct { float x, y, z; } vec3;
@@ -96,16 +232,13 @@ static inline void sincos256_ps(__m256 x, __m256 *out_sin, __m256 *out_cos) {
     const __m256 half_pi   = _mm256_set1_ps(1.57079632679f);
     const __m256 pi        = _mm256_set1_ps(3.14159265359f);
 
-    /* Range reduce x into [-pi, pi] */
     __m256 k = _mm256_round_ps(_mm256_mul_ps(x, inv_twopi), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     x = _mm256_fnmadd_ps(k, twopi, x);
 
-    /* Cosine is sin(x + pi/2) folded into [-pi, pi] */
     __m256 xc = _mm256_add_ps(x, half_pi);
     __m256 wrap_mask = _mm256_cmp_ps(xc, pi, _CMP_GT_OQ);
     xc = _mm256_sub_ps(xc, _mm256_and_ps(wrap_mask, twopi));
 
-    /* Parabola + FMA refinement (high-precision Bhaskara/parabolic approx) */
     const __m256 B = _mm256_set1_ps(1.2732395447f);
     const __m256 C = _mm256_set1_ps(-0.4052847345f);
     const __m256 P = _mm256_set1_ps(0.225f);
@@ -117,7 +250,6 @@ static inline void sincos256_ps(__m256 x, __m256 *out_sin, __m256 *out_cos) {
     *out_cos  = _mm256_fmadd_ps(P, _mm256_fnmadd_ps(yc, yc, _mm256_mul_ps(yc, abs256_ps(yc))), yc);
 }
 
-/* Smooth minimum in 8 lanes */
 static inline __m256 smin256_ps(__m256 a, __m256 b, float k_scalar) {
     __m256 k = _mm256_set1_ps(k_scalar);
     __m256 inv_k = _mm256_set1_ps(0.5f / k_scalar);
@@ -139,25 +271,27 @@ typedef struct {
 
 static SceneFrame prepare_scene_frame(float t) {
     SceneFrame sf;
+    float bass = atomic_load_explicit(&g_audio_bass, memory_order_relaxed);
+
     sf.t = t;
     sf.rot_yc = cosf(t * 0.8f); sf.rot_ys = sinf(t * 0.8f);
     sf.rot_xc = cosf(t * 0.6f); sf.rot_xs = sinf(t * 0.6f);
-    sf.twist  = sinf(t * 0.7f) * 1.2f;
+    sf.twist  = sinf(t * 0.7f) * (1.2f + bass * 1.1f);
+    float orbit_r = 1.35f + bass * 0.35f;
+
     for (int i = 0; i < 3; i++) {
         float ang = t * 1.4f + i * 2.094395f;
-        sf.blob_centers[i] = v3(cosf(ang) * 1.35f, sinf(ang * 1.5f) * 0.65f, sinf(ang) * 1.35f);
+        sf.blob_centers[i] = v3(cosf(ang) * orbit_r, sinf(ang * 1.5f) * 0.65f, sinf(ang) * orbit_r);
     }
     return sf;
 }
 
 typedef struct {
     __m256 dist;
-    __m256 mat_id; /* 1.0f = floor, 2.0f = object */
+    __m256 mat_id;
 } Hit_avx;
 
-/* --- 8-Wide Vectorized SDF Evaluation --- */
 static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
-    /* 1. Ground plane with sine-wave ripple */
     __m256 wx = _mm256_fmadd_ps(p.x, _mm256_set1_ps(2.5f), _mm256_set1_ps(sf->t * 2.0f));
     __m256 wz = _mm256_fmadd_ps(p.z, _mm256_set1_ps(2.5f), _mm256_set1_ps(sf->t * 1.5f));
     __m256 sin_wx, dummy_cos, dummy_sin, cos_wz;
@@ -167,19 +301,15 @@ static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
     __m256 wave = _mm256_mul_ps(_mm256_set1_ps(0.15f), _mm256_mul_ps(sin_wx, cos_wz));
     __m256 floor_dist = _mm256_add_ps(_mm256_add_ps(p.y, _mm256_set1_ps(1.8f)), wave);
 
-    /* 2. Rotating twisted torus */
     __m256 tpy = _mm256_sub_ps(p.y, _mm256_set1_ps(0.1f));
     __m256 ryc = _mm256_set1_ps(sf->rot_yc), rys = _mm256_set1_ps(sf->rot_ys);
     __m256 rxc = _mm256_set1_ps(sf->rot_xc), rxs = _mm256_set1_ps(sf->rot_xs);
 
-    /* Rotate Y */
     __m256 x1 = _mm256_fmadd_ps(ryc, p.x, _mm256_mul_ps(rys, p.z));
     __m256 z1 = _mm256_fnmadd_ps(rys, p.x, _mm256_mul_ps(ryc, p.z));
-    /* Rotate X */
     __m256 y2 = _mm256_fnmadd_ps(rxs, z1, _mm256_mul_ps(rxc, tpy));
     __m256 z2 = _mm256_fmadd_ps(rxs, tpy, _mm256_mul_ps(rxc, z1));
 
-    /* Twist along Y */
     __m256 twist_ang = _mm256_mul_ps(_mm256_set1_ps(sf->twist), y2);
     __m256 ts, tc;
     sincos256_ps(twist_ang, &ts, &tc);
@@ -192,7 +322,6 @@ static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
     __m256 torus_dist = _mm256_sub_ps(_mm256_sqrt_ps(_mm256_fmadd_ps(qx, qx, _mm256_mul_ps(y2, y2))),
                                       _mm256_set1_ps(0.32f));
 
-    /* Orbiting satellite spheres */
     __m256 blobs = _mm256_set1_ps(1e9f);
     for (int i = 0; i < 3; i++) {
         vec3_avx c = v3a_set1(sf->blob_centers[i].x, sf->blob_centers[i].y, sf->blob_centers[i].z);
@@ -201,15 +330,14 @@ static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
     }
 
     __m256 obj_dist = smin256_ps(torus_dist, blobs, 0.35f);
-    /* Branchless selection between floor (1.0f) and sculpture (2.0f) */
     __m256 is_floor = _mm256_cmp_ps(floor_dist, obj_dist, _CMP_LT_OQ);
+
     Hit_avx res;
     res.dist   = _mm256_min_ps(floor_dist, obj_dist);
     res.mat_id = _mm256_blendv_ps(_mm256_set1_ps(2.0f), _mm256_set1_ps(1.0f), is_floor);
     return res;
 }
 
-/* 8-Wide Surface Normal via Finite Differences */
 static vec3_avx calc_normal_avx2(vec3_avx p, const SceneFrame *sf) {
     __m256 eps = _mm256_set1_ps(0.0015f);
     __m256 d   = map_scene_avx2(p, sf).dist;
@@ -225,7 +353,6 @@ static vec3_avx calc_normal_avx2(vec3_avx p, const SceneFrame *sf) {
     return v3a_norm(n);
 }
 
-/* 8-Wide Cosine Iridescent Palette */
 static vec3_avx palette_avx2(__m256 t) {
     const __m256 twopi = _mm256_set1_ps(6.2831853f);
     __m256 s, c0, c1, c2;
@@ -241,7 +368,6 @@ static vec3_avx palette_avx2(__m256 t) {
     };
 }
 
-/* --- 8-Wide Raymarching + Shading Packet --- */
 typedef struct { uint8_t r, g, b; } RGB;
 
 static void render_packet8_avx2(
@@ -255,7 +381,6 @@ static void render_packet8_avx2(
     vec3_avx up    = v3a_set1(cam_up.x, cam_up.y, cam_up.z);
     vec3_avx fwd   = v3a_set1(cam_fwd.x * 1.6f, cam_fwd.y * 1.6f, cam_fwd.z * 1.6f);
 
-    /* Construct 8 ray directions: rd = norm(right*uv_x + up*uv_y + fwd*1.6) */
     vec3_avx rd = v3a_norm(v3a_fmadd(right, uv_x, v3a_fmadd(up, uv_y, fwd)));
 
     __m256 total_dist = _mm256_setzero_ps();
@@ -265,7 +390,6 @@ static void render_packet8_avx2(
     const __m256 eps_hit  = _mm256_set1_ps(0.0025f);
     const __m256 max_dist = _mm256_set1_ps(22.0f);
 
-    /* 8-Wide Lockstep Raymarch Loop with Early Packet Termination */
     for (int step = 0; step < 64; step++) {
         vec3_avx p = v3a_fmadd(rd, total_dist, ro);
         Hit_avx h  = map_scene_avx2(p, sf);
@@ -273,7 +397,6 @@ static void render_packet8_avx2(
         __m256 hit_now = _mm256_and_ps(active, _mm256_cmp_ps(h.dist, eps_hit, _CMP_LT_OQ));
         hit_mat = _mm256_blendv_ps(hit_mat, h.mat_id, hit_now);
 
-        /* Advance only lanes that haven't hit or exceeded max_dist */
         __m256 still_marching = _mm256_andnot_ps(hit_now, active);
         total_dist = _mm256_add_ps(total_dist, _mm256_and_ps(still_marching, h.dist));
 
@@ -281,7 +404,6 @@ static void render_packet8_avx2(
         if (_mm256_movemask_ps(active) == 0) break;
     }
 
-    /* Sky gradient default */
     __m256 sky_factor = _mm256_fnmadd_ps(_mm256_set1_ps(0.3f), uv_y, _mm256_set1_ps(1.0f));
     vec3_avx col = v3a_scale(v3a_set1(0.05f, 0.04f, 0.12f), sky_factor);
 
@@ -295,25 +417,21 @@ static void render_packet8_avx2(
 
         __m256 diff = _mm256_max_ps(v3a_dot(n, l), _mm256_setzero_ps());
 
-         /* Fast 4-step ambient occlusion / shadow approximation in SIMD */
         vec3_avx shadow_ro = v3a_fmadd(n, _mm256_set1_ps(0.03f), p);
         __m256 sh_dist = map_scene_avx2(v3a_fmadd(l, _mm256_set1_ps(0.35f), shadow_ro), sf).dist;
         __m256 shadow  = clamp256_ps(_mm256_mul_ps(sh_dist, _mm256_set1_ps(3.0f)),
                                      _mm256_set1_ps(0.15f), _mm256_set1_ps(1.0f));
         diff = _mm256_mul_ps(diff, shadow);
 
-        /* Blinn-Phong Specular (x^32 via 5 squarings) */
         vec3_avx view_dir = v3a_scale(rd, _mm256_set1_ps(-1.0f));
         vec3_avx half_dir = v3a_norm(v3a_add(l, view_dir));
         __m256 spec = _mm256_max_ps(v3a_dot(n, half_dir), _mm256_setzero_ps());
         for (int k = 0; k < 5; k++) spec = _mm256_mul_ps(spec, spec);
         spec = _mm256_mul_ps(spec, shadow);
 
-        /* Fresnel rim lighting (x^3) */
         __m256 fn_base = _mm256_sub_ps(_mm256_set1_ps(1.0f), _mm256_max_ps(v3a_dot(n, view_dir), _mm256_setzero_ps()));
         __m256 fresnel = _mm256_mul_ps(fn_base, _mm256_mul_ps(fn_base, fn_base));
 
-        /* Floor vs. Sculpture Material Blending */
         __m256 gx = abs256_ps(_mm256_mul_ps(p.x, _mm256_set1_ps(1.5f)));
         __m256 gz = abs256_ps(_mm256_mul_ps(p.z, _mm256_set1_ps(1.5f)));
         gx = _mm256_sub_ps(gx, _mm256_floor_ps(gx));
@@ -337,7 +455,6 @@ static void render_packet8_avx2(
             _mm256_blendv_ps(obj_col.z, floor_col.z, is_floor)
         };
 
-        /* Combine lighting + distance fog */
         vec3_avx lit = {
             _mm256_fmadd_ps(base_col.x, _mm256_fmadd_ps(_mm256_set1_ps(1.00f), diff, _mm256_set1_ps(0.08f)), _mm256_mul_ps(spec, _mm256_set1_ps(0.7f))),
             _mm256_fmadd_ps(base_col.y, _mm256_fmadd_ps(_mm256_set1_ps(0.95f), diff, _mm256_set1_ps(0.07f)), _mm256_mul_ps(spec, _mm256_set1_ps(0.7f))),
@@ -345,7 +462,6 @@ static void render_packet8_avx2(
         };
         lit = v3a_fmadd(v3a_set1(0.2f, 0.6f, 1.0f), _mm256_mul_ps(fresnel, _mm256_set1_ps(0.45f)), lit);
 
-        /* Rational distance fog approximation: 1 / (1 + 0.008 * d^2) */
         __m256 fog = _mm256_rcp_ps(_mm256_fmadd_ps(_mm256_set1_ps(0.008f), _mm256_mul_ps(total_dist, total_dist), _mm256_set1_ps(1.0f)));
         __m256 one_minus_fog = _mm256_sub_ps(_mm256_set1_ps(1.0f), fog);
         vec3_avx fogged = v3a_fmadd(lit, fog, v3a_scale(v3a_set1(0.04f, 0.03f, 0.09f), one_minus_fog));
@@ -355,7 +471,6 @@ static void render_packet8_avx2(
         col.z = _mm256_blendv_ps(col.z, fogged.z, any_hit_mask);
     }
 
-    /* Gamma correction (sqrt) + [0, 255] scaling */
     __m256 zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f), c255 = _mm256_set1_ps(255.0f);
     __m256 r_f = _mm256_mul_ps(_mm256_sqrt_ps(clamp256_ps(col.x, zero, one)), c255);
     __m256 g_f = _mm256_mul_ps(_mm256_sqrt_ps(clamp256_ps(col.y, zero, one)), c255);
@@ -366,7 +481,6 @@ static void render_packet8_avx2(
     _mm256_store_si256((__m256i *)g_i, _mm256_cvttps_epi32(g_f));
     _mm256_store_si256((__m256i *)b_i, _mm256_cvttps_epi32(b_f));
 
-    /* Quantize lowest 2 bits (& 0xFC) to boost RLE compression in smooth gradients */
     for (int lane = 0; lane < 8; lane++) {
         out_pixels[lane] = (RGB){
             (uint8_t)(r_i[lane] & 0xFC),
@@ -377,9 +491,6 @@ static void render_packet8_avx2(
 }
 
 /* --- Engine & Worker Pool State --- */
-static volatile sig_atomic_t g_running = 1;
-static volatile sig_atomic_t g_resized = 1;
-
 static int g_term_w = 80;
 static int g_term_h = 24;
 static RGB *g_framebuffer = NULL;
@@ -388,7 +499,6 @@ static char *g_ansibuf = NULL;
 static float g_time = 0.0f;
 static float g_cam_yaw = 0.4f;
 static float g_cam_zoom = 3.6f;
-static bool  g_paused = false;
 static SceneFrame g_scene_frame;
 
 static int g_num_threads = 4;
@@ -424,7 +534,6 @@ static void *render_worker_avx2(void *arg) {
         float aspect = (float)w / (float)pix_h;
         float inv_w2 = (2.0f * aspect) / (float)w;
 
-        /* Precompute camera basis once per worker pass */
         vec3 ro      = v3(sinf(g_cam_yaw) * g_cam_zoom, 0.7f, cosf(g_cam_yaw) * g_cam_zoom);
         vec3 target  = v3(0.0f, -0.1f, 0.0f);
         vec3 forward = v3_norm(v3_sub(target, ro));
@@ -440,14 +549,12 @@ static void *render_worker_avx2(void *arg) {
             RGB *row = &g_framebuffer[py * w];
 
             int px = 0;
-            /* Process 8 horizontal pixels at a time */
             for (; px <= w - 8; px += 8) {
                 __m256 px_vec = _mm256_add_ps(_mm256_set1_ps((float)px), lane_offsets);
                 __m256 uv_x   = _mm256_fmadd_ps(px_vec, _mm256_set1_ps(inv_w2), _mm256_set1_ps(-aspect));
                 render_packet8_avx2(uv_x, uv_y, ro, right, up, forward, &g_scene_frame, &row[px]);
             }
 
-            /* Tail handling when terminal width is not a multiple of 8 */
             if (px < w) {
                 RGB tmp[8];
                 __m256 px_vec = _mm256_add_ps(_mm256_set1_ps((float)px), lane_offsets);
@@ -481,7 +588,6 @@ static inline char *fast_utoa(char *p, uint8_t v) {
     return p;
 }
 
-/* Guaranteed complete write loop to prevent partial PTY frame flushes */
 static void write_all(int fd, const char *buf, size_t len) {
     size_t written = 0;
     while (written < len) {
@@ -534,9 +640,12 @@ static inline bool rgb_eq(RGB a, RGB b) {
     return a.r == b.r && a.g == b.g && a.b == b.b;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     signal(SIGINT, handle_sigint);
     signal(SIGWINCH, handle_sigwinch);
+
+    TrackerEngine tracker;
+    tracker_start(&tracker, (argc > 1) ? argv[1] : NULL);
 
     init_terminal();
     update_dimensions();
@@ -562,7 +671,10 @@ int main(void) {
         char ch;
         while (read(STDIN_FILENO, &ch, 1) > 0) {
             if (ch == 'q' || ch == 'Q' || ch == 27) g_running = 0;
-            else if (ch == ' ') g_paused = !g_paused;
+            else if (ch == ' ') {
+                bool cur = atomic_load_explicit(&g_paused, memory_order_relaxed);
+                atomic_store_explicit(&g_paused, !cur, memory_order_relaxed);
+            }
             else if (ch == 'a' || ch == 'A') g_cam_yaw -= 0.12f;
             else if (ch == 'd' || ch == 'D') g_cam_yaw += 0.12f;
             else if (ch == 'w' || ch == 'W') g_cam_zoom = fmaxf(1.8f, g_cam_zoom - 0.2f);
@@ -574,7 +686,7 @@ int main(void) {
                    (float)(ts_now.tv_nsec - ts_prev.tv_nsec) * 1e-9f;
         ts_prev = ts_now;
 
-        if (!g_paused) {
+        if (!atomic_load_explicit(&g_paused, memory_order_relaxed)) {
             g_time += dt;
             g_cam_yaw += dt * 0.25f;
         }
@@ -589,7 +701,6 @@ int main(void) {
         }
         pthread_mutex_unlock(&g_mutex);
 
-        /* Measure pure compute + render throughput before frame sleep */
         struct timespec ts_rendered;
         clock_gettime(CLOCK_MONOTONIC, &ts_rendered);
         float render_dt = (float)(ts_rendered.tv_sec - ts_now.tv_sec) +
@@ -598,10 +709,7 @@ int main(void) {
             fps_compute = fps_compute * 0.9f + (1.0f / render_dt) * 0.1f;
         }
 
-        /* --- Build Synchronized, RLE-Compressed ANSI Stream --- */
         char *p = g_ansibuf;
-
-        /* DEC Mode 2026: Begin Synchronized Update (\033[?2026h) + Home Cursor (\033[H) */
         memcpy(p, "\033[?2026h\033[H", 11);
         p += 11;
 
@@ -616,7 +724,6 @@ int main(void) {
                 RGB top = top_row[col];
                 RGB bot = bot_row[col];
 
-                /* Case 1: Both vertical sub-pixels share the exact same color -> emit single space ' ' */
                 if (rgb_eq(top, bot)) {
                     if (!has_bg || !rgb_eq(bot, prev_bg)) {
                         memcpy(p, "\033[48;2;", 7); p += 7;
@@ -630,7 +737,6 @@ int main(void) {
                     continue;
                 }
 
-                /* Case 2: Different top/bottom colors -> only emit changed FG or BG state */
                 bool fg_changed = !has_fg || !rgb_eq(top, prev_fg);
                 bool bg_changed = !has_bg || !rgb_eq(bot, prev_bg);
 
@@ -661,7 +767,6 @@ int main(void) {
                     has_bg = true;
                 }
 
-                /* UTF-8 Upper Half Block U+2580: ▀ */
                 *p++ = (char)0xE2; *p++ = (char)0x96; *p++ = (char)0x80;
             }
             memcpy(p, "\033[0m\r\n", 6);
@@ -670,15 +775,17 @@ int main(void) {
 
         size_t payload_kb = (size_t)(p - g_ansibuf) / 1024;
 
-        /* Telemetry HUD + DEC Mode 2026 End Synchronized Update (\033[?2026l) */
         int hud_len = snprintf(p, 512,
-            "\033[48;2;20;20;35;38;2;0;255;200m ⚡ AVX2 VSYNC | %dx%d px | %zu KB/frame | %6.0f Compute FPS | [W/A/S/D] Orbit [SPACE] Pause [Q] Quit \033[K\033[0m\033[?2026l",
-            g_term_w, g_term_h * 2, payload_kb, fps_compute);
+            "\033[48;2;20;20;35;38;2;0;255;200m ⚡ AVX2 DEMOSCENE | %dx%d | %zuKB | MOD [%02d:%02d %dBPM] | %6.0f FPS | [WASD] Orbit [SPACE] Pause [Q] Quit \033[K\033[0m\033[?2026l",
+            g_term_w, g_term_h * 2, payload_kb,
+            atomic_load_explicit(&g_tracker_pos, memory_order_relaxed),
+            atomic_load_explicit(&g_tracker_row, memory_order_relaxed),
+            atomic_load_explicit(&g_tracker_bpm, memory_order_relaxed),
+            fps_compute);
         if (hud_len > 0) p += hud_len;
 
         write_all(STDOUT_FILENO, g_ansibuf, (size_t)(p - g_ansibuf));
 
-        /* Absolute 60.0 Hz Monotonic Frame Pacing (16,666,667 ns) */
         ts_next_frame.tv_nsec += 16666667L;
         if (ts_next_frame.tv_nsec >= 1000000000L) {
             ts_next_frame.tv_sec += 1;
@@ -687,7 +794,6 @@ int main(void) {
 
         struct timespec ts_check;
         clock_gettime(CLOCK_MONOTONIC, &ts_check);
-        /* If terminal was slow and we fell behind deadline, resync instead of burst-catching up */
         if (ts_check.tv_sec > ts_next_frame.tv_sec ||
            (ts_check.tv_sec == ts_next_frame.tv_sec && ts_check.tv_nsec > ts_next_frame.tv_nsec)) {
             ts_next_frame = ts_check;
@@ -702,6 +808,8 @@ int main(void) {
     pthread_mutex_unlock(&g_mutex);
 
     for (int i = 0; i < g_num_threads; i++) pthread_join(threads[i], NULL);
+    tracker_stop(&tracker);
+
     free(threads); free(thread_ids); free(g_framebuffer); free(g_ansibuf);
     return 0;
 }
