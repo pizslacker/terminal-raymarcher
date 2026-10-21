@@ -2,7 +2,7 @@
 
 Zero-dependency, multithreaded real-time terminal raymarcher and plasma engine written in pure C11 and POSIX threads (pthreads).
 
-Tracker music track "Back in 1982" from [modarchive.org](https://modarchive.org/).
+Tracker music module "Back in 1982" from [modarchive.org](https://modarchive.org/).
 
 ![terminal-raymarcher](images/neon-marcher-avx2.png)
 
