@@ -25,7 +25,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdalign.h>
+#include <stdalign.h> /* Defines alignas -> _Alignas */
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -96,13 +96,16 @@ static inline void sincos256_ps(__m256 x, __m256 *out_sin, __m256 *out_cos) {
     const __m256 half_pi   = _mm256_set1_ps(1.57079632679f);
     const __m256 pi        = _mm256_set1_ps(3.14159265359f);
 
+    /* Range reduce x into [-pi, pi] */
     __m256 k = _mm256_round_ps(_mm256_mul_ps(x, inv_twopi), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     x = _mm256_fnmadd_ps(k, twopi, x);
 
+    /* Cosine is sin(x + pi/2) folded into [-pi, pi] */
     __m256 xc = _mm256_add_ps(x, half_pi);
     __m256 wrap_mask = _mm256_cmp_ps(xc, pi, _CMP_GT_OQ);
     xc = _mm256_sub_ps(xc, _mm256_and_ps(wrap_mask, twopi));
 
+    /* Parabola + FMA refinement (high-precision Bhaskara/parabolic approx) */
     const __m256 B = _mm256_set1_ps(1.2732395447f);
     const __m256 C = _mm256_set1_ps(-0.4052847345f);
     const __m256 P = _mm256_set1_ps(0.225f);
@@ -114,6 +117,7 @@ static inline void sincos256_ps(__m256 x, __m256 *out_sin, __m256 *out_cos) {
     *out_cos  = _mm256_fmadd_ps(P, _mm256_fnmadd_ps(yc, yc, _mm256_mul_ps(yc, abs256_ps(yc))), yc);
 }
 
+/* Smooth minimum in 8 lanes */
 static inline __m256 smin256_ps(__m256 a, __m256 b, float k_scalar) {
     __m256 k = _mm256_set1_ps(k_scalar);
     __m256 inv_k = _mm256_set1_ps(0.5f / k_scalar);
@@ -148,10 +152,12 @@ static SceneFrame prepare_scene_frame(float t) {
 
 typedef struct {
     __m256 dist;
-    __m256 mat_id;
+    __m256 mat_id; /* 1.0f = floor, 2.0f = object */
 } Hit_avx;
 
+/* --- 8-Wide Vectorized SDF Evaluation --- */
 static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
+    /* 1. Ground plane with sine-wave ripple */
     __m256 wx = _mm256_fmadd_ps(p.x, _mm256_set1_ps(2.5f), _mm256_set1_ps(sf->t * 2.0f));
     __m256 wz = _mm256_fmadd_ps(p.z, _mm256_set1_ps(2.5f), _mm256_set1_ps(sf->t * 1.5f));
     __m256 sin_wx, dummy_cos, dummy_sin, cos_wz;
@@ -161,15 +167,19 @@ static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
     __m256 wave = _mm256_mul_ps(_mm256_set1_ps(0.15f), _mm256_mul_ps(sin_wx, cos_wz));
     __m256 floor_dist = _mm256_add_ps(_mm256_add_ps(p.y, _mm256_set1_ps(1.8f)), wave);
 
+    /* 2. Rotating twisted torus */
     __m256 tpy = _mm256_sub_ps(p.y, _mm256_set1_ps(0.1f));
     __m256 ryc = _mm256_set1_ps(sf->rot_yc), rys = _mm256_set1_ps(sf->rot_ys);
     __m256 rxc = _mm256_set1_ps(sf->rot_xc), rxs = _mm256_set1_ps(sf->rot_xs);
 
+    /* Rotate Y */
     __m256 x1 = _mm256_fmadd_ps(ryc, p.x, _mm256_mul_ps(rys, p.z));
     __m256 z1 = _mm256_fnmadd_ps(rys, p.x, _mm256_mul_ps(ryc, p.z));
+    /* Rotate X */
     __m256 y2 = _mm256_fnmadd_ps(rxs, z1, _mm256_mul_ps(rxc, tpy));
     __m256 z2 = _mm256_fmadd_ps(rxs, tpy, _mm256_mul_ps(rxc, z1));
 
+    /* Twist along Y */
     __m256 twist_ang = _mm256_mul_ps(_mm256_set1_ps(sf->twist), y2);
     __m256 ts, tc;
     sincos256_ps(twist_ang, &ts, &tc);
@@ -182,6 +192,7 @@ static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
     __m256 torus_dist = _mm256_sub_ps(_mm256_sqrt_ps(_mm256_fmadd_ps(qx, qx, _mm256_mul_ps(y2, y2))),
                                       _mm256_set1_ps(0.32f));
 
+    /* Orbiting satellite spheres */
     __m256 blobs = _mm256_set1_ps(1e9f);
     for (int i = 0; i < 3; i++) {
         vec3_avx c = v3a_set1(sf->blob_centers[i].x, sf->blob_centers[i].y, sf->blob_centers[i].z);
@@ -190,14 +201,15 @@ static Hit_avx map_scene_avx2(vec3_avx p, const SceneFrame *sf) {
     }
 
     __m256 obj_dist = smin256_ps(torus_dist, blobs, 0.35f);
+    /* Branchless selection between floor (1.0f) and sculpture (2.0f) */
     __m256 is_floor = _mm256_cmp_ps(floor_dist, obj_dist, _CMP_LT_OQ);
-
     Hit_avx res;
     res.dist   = _mm256_min_ps(floor_dist, obj_dist);
     res.mat_id = _mm256_blendv_ps(_mm256_set1_ps(2.0f), _mm256_set1_ps(1.0f), is_floor);
     return res;
 }
 
+/* 8-Wide Surface Normal via Finite Differences */
 static vec3_avx calc_normal_avx2(vec3_avx p, const SceneFrame *sf) {
     __m256 eps = _mm256_set1_ps(0.0015f);
     __m256 d   = map_scene_avx2(p, sf).dist;
@@ -213,6 +225,7 @@ static vec3_avx calc_normal_avx2(vec3_avx p, const SceneFrame *sf) {
     return v3a_norm(n);
 }
 
+/* 8-Wide Cosine Iridescent Palette */
 static vec3_avx palette_avx2(__m256 t) {
     const __m256 twopi = _mm256_set1_ps(6.2831853f);
     __m256 s, c0, c1, c2;
@@ -228,6 +241,7 @@ static vec3_avx palette_avx2(__m256 t) {
     };
 }
 
+/* --- 8-Wide Raymarching + Shading Packet --- */
 typedef struct { uint8_t r, g, b; } RGB;
 
 static void render_packet8_avx2(
@@ -241,6 +255,7 @@ static void render_packet8_avx2(
     vec3_avx up    = v3a_set1(cam_up.x, cam_up.y, cam_up.z);
     vec3_avx fwd   = v3a_set1(cam_fwd.x * 1.6f, cam_fwd.y * 1.6f, cam_fwd.z * 1.6f);
 
+    /* Construct 8 ray directions: rd = norm(right*uv_x + up*uv_y + fwd*1.6) */
     vec3_avx rd = v3a_norm(v3a_fmadd(right, uv_x, v3a_fmadd(up, uv_y, fwd)));
 
     __m256 total_dist = _mm256_setzero_ps();
@@ -250,6 +265,7 @@ static void render_packet8_avx2(
     const __m256 eps_hit  = _mm256_set1_ps(0.0025f);
     const __m256 max_dist = _mm256_set1_ps(22.0f);
 
+    /* 8-Wide Lockstep Raymarch Loop with Early Packet Termination */
     for (int step = 0; step < 64; step++) {
         vec3_avx p = v3a_fmadd(rd, total_dist, ro);
         Hit_avx h  = map_scene_avx2(p, sf);
@@ -257,6 +273,7 @@ static void render_packet8_avx2(
         __m256 hit_now = _mm256_and_ps(active, _mm256_cmp_ps(h.dist, eps_hit, _CMP_LT_OQ));
         hit_mat = _mm256_blendv_ps(hit_mat, h.mat_id, hit_now);
 
+        /* Advance only lanes that haven't hit or exceeded max_dist */
         __m256 still_marching = _mm256_andnot_ps(hit_now, active);
         total_dist = _mm256_add_ps(total_dist, _mm256_and_ps(still_marching, h.dist));
 
@@ -264,6 +281,7 @@ static void render_packet8_avx2(
         if (_mm256_movemask_ps(active) == 0) break;
     }
 
+    /* Sky gradient default */
     __m256 sky_factor = _mm256_fnmadd_ps(_mm256_set1_ps(0.3f), uv_y, _mm256_set1_ps(1.0f));
     vec3_avx col = v3a_scale(v3a_set1(0.05f, 0.04f, 0.12f), sky_factor);
 
@@ -277,21 +295,25 @@ static void render_packet8_avx2(
 
         __m256 diff = _mm256_max_ps(v3a_dot(n, l), _mm256_setzero_ps());
 
+         /* Fast 4-step ambient occlusion / shadow approximation in SIMD */
         vec3_avx shadow_ro = v3a_fmadd(n, _mm256_set1_ps(0.03f), p);
         __m256 sh_dist = map_scene_avx2(v3a_fmadd(l, _mm256_set1_ps(0.35f), shadow_ro), sf).dist;
         __m256 shadow  = clamp256_ps(_mm256_mul_ps(sh_dist, _mm256_set1_ps(3.0f)),
                                      _mm256_set1_ps(0.15f), _mm256_set1_ps(1.0f));
         diff = _mm256_mul_ps(diff, shadow);
 
+        /* Blinn-Phong Specular (x^32 via 5 squarings) */
         vec3_avx view_dir = v3a_scale(rd, _mm256_set1_ps(-1.0f));
         vec3_avx half_dir = v3a_norm(v3a_add(l, view_dir));
         __m256 spec = _mm256_max_ps(v3a_dot(n, half_dir), _mm256_setzero_ps());
         for (int k = 0; k < 5; k++) spec = _mm256_mul_ps(spec, spec);
         spec = _mm256_mul_ps(spec, shadow);
 
+        /* Fresnel rim lighting (x^3) */
         __m256 fn_base = _mm256_sub_ps(_mm256_set1_ps(1.0f), _mm256_max_ps(v3a_dot(n, view_dir), _mm256_setzero_ps()));
         __m256 fresnel = _mm256_mul_ps(fn_base, _mm256_mul_ps(fn_base, fn_base));
 
+        /* Floor vs. Sculpture Material Blending */
         __m256 gx = abs256_ps(_mm256_mul_ps(p.x, _mm256_set1_ps(1.5f)));
         __m256 gz = abs256_ps(_mm256_mul_ps(p.z, _mm256_set1_ps(1.5f)));
         gx = _mm256_sub_ps(gx, _mm256_floor_ps(gx));
@@ -315,6 +337,7 @@ static void render_packet8_avx2(
             _mm256_blendv_ps(obj_col.z, floor_col.z, is_floor)
         };
 
+        /* Combine lighting + distance fog */
         vec3_avx lit = {
             _mm256_fmadd_ps(base_col.x, _mm256_fmadd_ps(_mm256_set1_ps(1.00f), diff, _mm256_set1_ps(0.08f)), _mm256_mul_ps(spec, _mm256_set1_ps(0.7f))),
             _mm256_fmadd_ps(base_col.y, _mm256_fmadd_ps(_mm256_set1_ps(0.95f), diff, _mm256_set1_ps(0.07f)), _mm256_mul_ps(spec, _mm256_set1_ps(0.7f))),
@@ -322,6 +345,7 @@ static void render_packet8_avx2(
         };
         lit = v3a_fmadd(v3a_set1(0.2f, 0.6f, 1.0f), _mm256_mul_ps(fresnel, _mm256_set1_ps(0.45f)), lit);
 
+        /* Rational distance fog approximation: 1 / (1 + 0.008 * d^2) */
         __m256 fog = _mm256_rcp_ps(_mm256_fmadd_ps(_mm256_set1_ps(0.008f), _mm256_mul_ps(total_dist, total_dist), _mm256_set1_ps(1.0f)));
         __m256 one_minus_fog = _mm256_sub_ps(_mm256_set1_ps(1.0f), fog);
         vec3_avx fogged = v3a_fmadd(lit, fog, v3a_scale(v3a_set1(0.04f, 0.03f, 0.09f), one_minus_fog));
@@ -331,6 +355,7 @@ static void render_packet8_avx2(
         col.z = _mm256_blendv_ps(col.z, fogged.z, any_hit_mask);
     }
 
+    /* Gamma correction (sqrt) + [0, 255] scaling */
     __m256 zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f), c255 = _mm256_set1_ps(255.0f);
     __m256 r_f = _mm256_mul_ps(_mm256_sqrt_ps(clamp256_ps(col.x, zero, one)), c255);
     __m256 g_f = _mm256_mul_ps(_mm256_sqrt_ps(clamp256_ps(col.y, zero, one)), c255);
@@ -399,6 +424,7 @@ static void *render_worker_avx2(void *arg) {
         float aspect = (float)w / (float)pix_h;
         float inv_w2 = (2.0f * aspect) / (float)w;
 
+        /* Precompute camera basis once per worker pass */
         vec3 ro      = v3(sinf(g_cam_yaw) * g_cam_zoom, 0.7f, cosf(g_cam_yaw) * g_cam_zoom);
         vec3 target  = v3(0.0f, -0.1f, 0.0f);
         vec3 forward = v3_norm(v3_sub(target, ro));
@@ -414,12 +440,14 @@ static void *render_worker_avx2(void *arg) {
             RGB *row = &g_framebuffer[py * w];
 
             int px = 0;
+            /* Process 8 horizontal pixels at a time */
             for (; px <= w - 8; px += 8) {
                 __m256 px_vec = _mm256_add_ps(_mm256_set1_ps((float)px), lane_offsets);
                 __m256 uv_x   = _mm256_fmadd_ps(px_vec, _mm256_set1_ps(inv_w2), _mm256_set1_ps(-aspect));
                 render_packet8_avx2(uv_x, uv_y, ro, right, up, forward, &g_scene_frame, &row[px]);
             }
 
+            /* Tail handling when terminal width is not a multiple of 8 */
             if (px < w) {
                 RGB tmp[8];
                 __m256 px_vec = _mm256_add_ps(_mm256_set1_ps((float)px), lane_offsets);
@@ -561,6 +589,7 @@ int main(void) {
         }
         pthread_mutex_unlock(&g_mutex);
 
+        /* Measure pure compute + render throughput before frame sleep */
         struct timespec ts_rendered;
         clock_gettime(CLOCK_MONOTONIC, &ts_rendered);
         float render_dt = (float)(ts_rendered.tv_sec - ts_now.tv_sec) +
