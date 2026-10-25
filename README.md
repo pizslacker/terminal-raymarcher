@@ -2,6 +2,8 @@
 
 Zero-dependency, multithreaded real-time terminal raymarcher and plasma engine written in pure C11 and POSIX threads (pthreads).
 
+YT-video demonstration: https://www.youtube.com/watch?v=yDvKk1sBX1Y
+
 Tracker music module "_09chip - Back in 1982_" from [modarchive.org](https://modarchive.org/).
 
 ![terminal-raymarcher](images/neon-marcher-avx2.png)
